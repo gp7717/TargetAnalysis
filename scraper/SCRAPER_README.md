@@ -63,6 +63,9 @@ python target_handbags_advanced.py --max-products 50 --verbose
 
 # Include detailed product pages
 python target_handbags_advanced.py --max-products 30 --details --delay-min 2 --delay-max 4
+
+# Skip already-scraped products using a persistent URL cache
+python target_handbags_advanced.py --details --seen-urls-file ../output/target_handbags_seen_urls.json
 ```
 
 ### Command Line Arguments
@@ -74,6 +77,26 @@ python target_handbags_advanced.py --max-products 30 --details --delay-min 2 --d
 --verbose         FLAG    Enable verbose logging
 --details         FLAG    Extract detailed info from product pages
 --output-dir      STR     Output directory (default: ../output)
+--seen-urls-file   STR     JSON cache of already-scraped product URLs (default: ../output/target_handbags_seen_urls.json)
+
+# Detail-page parallelism (optional)
+--proxies-file                STR   Proxy list file (csv/whitespace)
+--max-proxy-sessions          INT   Cap number of proxy sessions used
+--max-concurrent-per-proxy    INT   Max concurrent detail pages per proxy session (default: 3)
+--products-per-proxy-session  INT   Recycle context after N detail pages (default: 40)
+
+# Bursty scheduling knobs
+--burst-min                   INT   Min detail pages per burst (default: 6)
+--burst-max                   INT   Max detail pages per burst (default: 18)
+--inter-request-delay-min     FLOAT Detail request jitter min seconds (default: 0.9)
+--inter-request-delay-max     FLOAT Detail request jitter max seconds (default: 4.2)
+--inter-burst-sleep-min       FLOAT Between-burst sleep min seconds (default: 15)
+--inter-burst-sleep-max       FLOAT Between-burst sleep max seconds (default: 90)
+
+# Performance toggles
+--block-resources/--no-block-resources   BOOL   Block images/fonts/media for speed (default: True)
+--block-stylesheets                     FLAG   Also block stylesheets (may break some pages)
+--randomize-context                      FLAG   Randomize viewport/locale/timezone per context
 ```
 
 ### Python API

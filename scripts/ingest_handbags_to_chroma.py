@@ -34,37 +34,38 @@ BATCH_SIZE = 32
 # CLIP context is 77 tokens; keep document text within ~500 chars to be safe
 MAX_DOCUMENT_CHARS = 500
 
-
-def load_products(path: Path) -> list[dict]:
-    """Load products from JSON or CSV. Prefer JSON for reliability."""
-    path = Path(path)
-    if not path.exists():
-        raise FileNotFoundError(f"Input file not found: {path}")
-
-    suffix = path.suffix.lower()
-    if suffix == ".json":
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, list):
-            return data
-        if isinstance(data, dict) and "products" in data:
-            return data["products"]
-        return [data]
-    if suffix == ".jsonl":
-        products = []
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                products.append(json.loads(line))
-        return products
-    if suffix == ".csv":
-        import csv
-        with open(path, encoding="utf-8", newline="") as f:
-            reader = csv.DictReader(f)
-            return list(reader)
-    raise ValueError(f"Unsupported format: {suffix}. Use .json, .jsonl, or .csv")
+try:
+    from analysis.utils import load_products
+except ImportError:
+    # Fallback when run from elsewhere or analysis not on path
+    def load_products(path: Path) -> list[dict]:
+        path = Path(path)
+        if not path.exists():
+            raise FileNotFoundError(f"Input file not found: {path}")
+        suffix = path.suffix.lower()
+        if suffix == ".json":
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return data
+            if isinstance(data, dict) and "products" in data:
+                return data["products"]
+            return [data]
+        if suffix == ".jsonl":
+            products = []
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    products.append(json.loads(line))
+            return products
+        if suffix == ".csv":
+            import csv
+            with open(path, encoding="utf-8", newline="") as f:
+                reader = csv.DictReader(f)
+                return list(reader)
+        raise ValueError(f"Unsupported format: {suffix}. Use .json, .jsonl, or .csv")
 
 
 def safe_str(v: object) -> str:

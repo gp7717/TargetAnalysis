@@ -37,6 +37,23 @@ Default input: `output/target_handbags_20260220_180219.json`. Supports `.json`, 
 
 ---
 
+## Gap analysis (clustering + report)
+
+The script `scripts/run_gap_analysis.py` runs internal gap analysis on handbags data **without** competitor data: style clustering (K-Means/HDBSCAN), PCA/UMAP, price segmentation, rating×review quadrants, brand dominance, color diversity, title-keyword co-occurrence, and six practical gap analyses (SKU density map, rating-weighted strength, new vs established, bestseller gap, clearance pattern, in-stock pressure). Outputs an enriched CSV/JSON and a markdown report.
+
+**Requires:** Same as ingest (PyTorch, CLIP) plus `scikit-learn`, `hdbscan`, `umap-learn` (see `requirements.txt`).
+
+```bash
+# From project root
+python scripts/run_gap_analysis.py output/target_handbags_20260220_213726.csv
+# Options: -o OUTPUT_DIR, -k N_CLUSTERS, --no-hdbscan, --no-umap, --review-high N
+# Use --quick-test to run without PyTorch/CLIP (TF-IDF embeddings; good for CI/smoke test).
+```
+
+Default output directory: `output/`. Files: `gap_analysis_handbags_YYYYMMDD_HHMMSS.csv`, `.json`, and `_report.md`.
+
+---
+
 ## Push to GitHub
 
 ```bash

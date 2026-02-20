@@ -26,7 +26,6 @@ import json
 import logging
 import re
 import csv
-import os
 from typing import Dict, List, Optional, Any, Tuple
 from datetime import datetime
 from pathlib import Path
@@ -51,7 +50,6 @@ class ProductMetadata:
     product_id: str
     title: str
     url: str
-    tcin: str = ""
     brand: str = ""
     price_current: float = 0.0
     price_regular: float = 0.0
@@ -78,7 +76,6 @@ class ProductMetadata:
     best_seller: bool = False
     seller: str = ""
     fulfillment_info: str = ""
-    add_to_cart_available: bool = False
     in_stock: bool = True
     scraped_at: str = field(default_factory=lambda: datetime.now().isoformat())
 
@@ -107,15 +104,8 @@ class TargetHandbagsScraper:
     additional details from individual product pages.
     """
 
-    def __init__(
-        self,
-        max_products: Optional[int] = None,
-        delay_min: float = 1.0,
-        delay_max: float = 3.0,
-        headless: bool = True,
-        verbose: bool = False,
-        allow_proxy: bool = False,
-    ):
+    def __init__(self, max_products: Optional[int] = None, delay_min: float = 1.0,
+                 delay_max: float = 3.0, headless: bool = True, verbose: bool = False):
         """
         Initialize the scraper.
 
@@ -131,7 +121,6 @@ class TargetHandbagsScraper:
         self.delay_max = delay_max
         self.headless = headless
         self.verbose = verbose
-        self.allow_proxy = allow_proxy
         self.products: List[ProductMetadata] = []
         self.base_url = "https://www.target.com/c/handbags-purses-accessories/-/N-5xtbo"
         self.playwright: Optional[Playwright] = None
@@ -144,26 +133,7 @@ class TargetHandbagsScraper:
     async def setup(self):
         """Setup browser and context"""
         self.playwright = await async_playwright().start()
-
-        launch_env = os.environ.copy()
-        launch_args: List[str] = []
-        if not self.allow_proxy:
-            # Ensure Playwright's Chromium process does not inherit any proxy settings.
-            # This handles cases where HTTP(S)_PROXY/ALL_PROXY are set in the shell.
-            for key in (
-                'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
-                'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy',
-            ):
-                launch_env.pop(key, None)
-            # Explicitly disable proxy at the Chromium layer too.
-            launch_args.extend(['--no-proxy-server', '--proxy-bypass-list=*'])
-            logger.info("Proxy disabled (env + Chromium args)")
-
-        self.browser = await self.playwright.chromium.launch(
-            headless=self.headless,
-            args=launch_args or None,
-            env=launch_env,
-        )
+        self.browser = await self.playwright.chromium.launch(headless=self.headless)
         self.context = await self.browser.new_context(
             ignore_https_errors=True,
             user_agent=(
@@ -199,107 +169,6 @@ class TargetHandbagsScraper:
         """Add random delay between requests"""
         delay = random.uniform(self.delay_min, self.delay_max)
         await asyncio.sleep(delay)
-
-    async def _scroll_listing_until_stable(
-        self,
-        page: Page,
-        *,
-        max_scrolls: int = 24,
-        stable_rounds: int = 3,
-        selector: str = '[data-test="@web/ProductCard/title"]',
-    ) -> None:
-        """Scroll a listing page until product links stop increasing.
-
-        Target frequently lazy-loads cards; snapshotting HTML too early can miss
-        products. This method scrolls in steps and stops when the number of title
-        links stabilizes for a few rounds.
-        """
-        try:
-            await page.wait_for_selector(selector, timeout=30000)
-        except Exception:
-            return
-
-        last_count = -1
-        stable = 0
-        locator = page.locator(selector)
-
-        for _ in range(max_scrolls):
-            try:
-                count = await locator.count()
-            except Exception:
-                count = last_count
-
-            if count == last_count:
-                stable += 1
-            else:
-                stable = 0
-                last_count = count
-
-            if stable >= stable_rounds:
-                break
-
-            try:
-                await page.evaluate('window.scrollBy(0, Math.max(window.innerHeight * 1.25, 900))')
-            except Exception:
-                break
-            await asyncio.sleep(0.9)
-
-    async def _extract_listing_title_links(self, page: Page) -> List[Dict[str, str]]:
-        """Extract all product title links on the current listing page.
-
-        Uses Target's stable data-test attribute on the title <a>.
-        Returns list items: {"href": <raw href>, "title": <text>}.
-        """
-        try:
-            items: List[Dict[str, str]] = await page.evaluate(
-                """() => {
-                    const sel = '[data-test="@web/ProductCard/title"]';
-                    const nodes = Array.from(document.querySelectorAll(sel));
-                    return nodes.map(a => ({
-                        href: (a.getAttribute('href') || '').trim(),
-                        title: (a.textContent || '').trim(),
-                    }));
-                }"""
-            )
-        except Exception:
-            return []
-
-        cleaned: List[Dict[str, str]] = []
-        for it in items or []:
-            href = (it.get('href') or '').strip()
-            if not href:
-                continue
-            # Target product PDP URLs include /A-<TCIN>
-            if '/A-' not in href:
-                continue
-            cleaned.append({'href': href, 'title': (it.get('title') or '').strip()})
-
-        if cleaned:
-            return cleaned
-
-        # Fallback: extract any product links within the product grid.
-        # This is less stable than data-test, but helps when Target A/B tests the DOM.
-        try:
-            items2: List[Dict[str, str]] = await page.evaluate(
-                """() => {
-                    const root = document.querySelector('div[data-test="product-grid"]') || document;
-                    const nodes = Array.from(root.querySelectorAll('a[href^="/p/"][href*="/A-"]'));
-                    return nodes.map(a => ({
-                        href: (a.getAttribute('href') || '').trim(),
-                        title: (a.textContent || a.getAttribute('aria-label') || '').trim(),
-                    }));
-                }"""
-            )
-        except Exception:
-            items2 = []
-
-        for it in items2 or []:
-            href = (it.get('href') or '').strip()
-            if not href or '/A-' not in href:
-                continue
-            cleaned.append({'href': href, 'title': (it.get('title') or '').strip()})
-
-        return cleaned
 
     async def _extract_product_card_data(self, card_html: str) -> Optional[ProductMetadata]:
         """
@@ -660,12 +529,6 @@ class TargetHandbagsScraper:
                 title = title_elem.get_text(strip=True) if title_elem else ""
                 product_id = self._extract_product_id(product_url)
 
-                # Brand (data-test first)
-                brand = ""
-                brand_link = soup.find('a', {'data-test': 'shopAllBrandLink'})
-                if brand_link:
-                    brand = brand_link.get_text(strip=True).replace('Shop all', '').strip()
-
                 # Prices
                 price_elem = soup.find('span', {'data-test': 'product-price'})
                 current_price = self._parse_price(price_elem.get_text(strip=True) if price_elem else "0")
@@ -676,15 +539,6 @@ class TargetHandbagsScraper:
                     if match:
                         regular_price = self._parse_price(match.group(1))
                 sale_price = current_price if (regular_price > 0 and current_price < regular_price) else 0.0
-
-                # Add-to-cart / stock signal (data-test first)
-                add_to_cart_available = False
-                in_stock = True
-                atc_btn = soup.find('button', {'data-test': 'shippingButton'})
-                if atc_btn:
-                    disabled = atc_btn.has_attr('disabled') or (atc_btn.get('aria-disabled') == 'true')
-                    add_to_cart_available = not disabled
-                    in_stock = not disabled
 
                 # Category breadcrumb
                 category_breadcrumb = ""
@@ -700,17 +554,8 @@ class TargetHandbagsScraper:
 
                 # Image gallery
                 images: List[str] = []
-                # Preferred: stable data-test gallery items
-                for img in soup.select('[data-test^="image-gallery-item-"] img'):
-                    src = (img.get('src') or '').strip()
-                    if src and 'target.scene7.com' in src and src not in images:
-                        # Normalize to higher-res where possible
-                        src = re.sub(r'wid=\d+', 'wid=1200', src)
-                        src = re.sub(r'hei=\d+', 'hei=1200', src)
-                        images.append(src)
-
                 gallery = soup.find('section', {'aria-label': 'Image gallery'})
-                if gallery and not images:
+                if gallery:
                     for img in gallery.find_all('img', src=True):
                         src = img.get('src')
                         if src and 'target.scene7.com' in src:
@@ -727,107 +572,16 @@ class TargetHandbagsScraper:
 
                 # Highlights
                 highlights: List[str] = []
-                # Preferred: stable data-test highlights block
-                for li in soup.select('[data-test="@web/ProductDetailPageHighlights"] ul li'):
-                    t = li.get_text(strip=True)
-                    if t:
-                        highlights.append(t)
-                if not highlights:
-                    highlights_section = soup.find('div', {'id': 'PdpHighlightsSection'})
-                    if highlights_section:
-                        for li in highlights_section.find_all('li'):
-                            t = li.get_text(strip=True)
-                            if t:
-                                highlights.append(t)
+                highlights_section = soup.find('div', {'id': 'PdpHighlightsSection'})
+                if highlights_section:
+                    for li in highlights_section.find_all('li'):
+                        t = li.get_text(strip=True)
+                        if t:
+                            highlights.append(t)
                 feature_bullets = list(highlights)
-
-                # Rating + count (data-test first; fallback to JSON-LD / DOM)
-                rating = 0.0
-                rating_count = 0
-                try:
-                    rating_count_span = soup.select_one('a[data-test="ratingCountLink"] span')
-                    if rating_count_span:
-                        m = re.search(r'(\d[\d,]*)', rating_count_span.get_text(strip=True))
-                        if m:
-                            rating_count = int(m.group(1).replace(',', ''))
-                except Exception:
-                    pass
-
-                def _parse_json_ld_aggregate_rating() -> Tuple[float, int]:
-                    for script in soup.find_all('script', attrs={'type': 'application/ld+json'}):
-                        raw = (script.string or '').strip()
-                        if not raw:
-                            continue
-                        try:
-                            obj = json.loads(raw)
-                        except Exception:
-                            continue
-
-                        candidates: List[Any] = []
-                        if isinstance(obj, list):
-                            candidates.extend(obj)
-                        else:
-                            candidates.append(obj)
-
-                        for c in candidates:
-                            if not isinstance(c, dict):
-                                continue
-                            # Sometimes JSON-LD uses @graph
-                            graph = c.get('@graph')
-                            if isinstance(graph, list):
-                                candidates.extend([g for g in graph if isinstance(g, dict)])
-
-                            if c.get('@type') not in ('Product', 'ProductGroup'):
-                                continue
-                            ar = c.get('aggregateRating')
-                            if not isinstance(ar, dict):
-                                continue
-                            rv = ar.get('ratingValue')
-                            rc = ar.get('ratingCount') or ar.get('reviewCount')
-                            try:
-                                rv_f = float(str(rv)) if rv is not None else 0.0
-                            except Exception:
-                                rv_f = 0.0
-                            try:
-                                rc_i = int(str(rc).replace(',', '')) if rc is not None else 0
-                            except Exception:
-                                rc_i = 0
-                            if rv_f or rc_i:
-                                return rv_f, rc_i
-                    return 0.0, 0
-
-                if rating == 0.0 or rating_count == 0:
-                    rv_f, rc_i = _parse_json_ld_aggregate_rating()
-                    if rating == 0.0 and rv_f:
-                        rating = rv_f
-                    if rating_count == 0 and rc_i:
-                        rating_count = rc_i
-
-                if rating == 0.0:
-                    # Last resort: hashed star container (may change)
-                    rating_container = soup.find('div', class_='styles_ndsRatingStars__uEZcs')
-                    if rating_container:
-                        for span in rating_container.find_all('span', {'aria-hidden': 'true'}):
-                            txt = span.get_text(strip=True)
-                            try:
-                                val = float(txt)
-                                if 0 <= val <= 5:
-                                    rating = val
-                                    break
-                            except Exception:
-                                continue
 
                 # Specifications
                 dimensions_table, specifications, material_text = self._parse_specifications_section(soup)
-
-                # TCIN explicit (promote from specs if present)
-                tcin = ""
-                for k, v in specifications.items():
-                    if k.strip().lower() == 'tcin':
-                        tcin = v.strip()
-                        break
-                if not tcin:
-                    tcin = product_id
                 dimensions: Dict[str, str] = {}
                 for highlight in highlights:
                     if 'measurements' in highlight.lower():
@@ -867,51 +621,23 @@ class TargetHandbagsScraper:
                     seller = seller_link.get_text(strip=True)
 
                 colors = []
+                color_carousel = soup.find('div', class_='styles_ndsCarousel__yMTV9')
+                if color_carousel:
+                    color_links = color_carousel.find_all('a', class_='styles_ndsChip__lwwR_')
+                    colors = [link.get_text(strip=True) for link in color_links]
                 color_selected = ""
-                # Preferred: data-test variation component (avoid hashed chip/carousel classes)
-                variation_components = soup.find_all(attrs={'data-test': '@web/VariationComponent'})
-                color_component = None
-                for comp in variation_components:
-                    if 'color' in (comp.get_text(" ", strip=True) or '').lower():
-                        color_component = comp
+                for part in product_url.split('/'):
+                    if part and part.lower() in [c.lower() for c in colors]:
+                        color_selected = part
                         break
-                if not color_component and variation_components:
-                    color_component = variation_components[0]
-
-                if color_component:
-                    opts: List[Tuple[str, str, bool]] = []
-                    for a in color_component.find_all('a', href=True):
-                        text = a.get_text(strip=True) or (a.get('aria-label') or '').strip()
-                        if not text or len(text) > 40:
-                            continue
-                        is_selected = (
-                            a.get('aria-current') in ('page', 'true')
-                            or a.get('aria-selected') == 'true'
-                        )
-                        opts.append((text, a.get('href') or '', is_selected))
-                    colors = [t for t, _, _ in opts]
-                    for t, _, is_sel in opts:
-                        if is_sel:
-                            color_selected = t
-                            break
-                if not color_selected and colors:
-                    # Heuristic: infer from URL slug fragments
-                    for part in product_url.split('/'):
-                        if part and any(part.lower() == c.lower().replace(' ', '-') for c in colors):
-                            color_selected = part
-                            break
 
                 return ProductMetadata(
                     product_id=product_id,
-                    tcin=tcin,
                     title=title,
                     url=product_url,
-                    brand=brand,
                     price_current=current_price,
                     price_regular=regular_price,
                     sale_price=sale_price,
-                    rating=rating,
-                    rating_count=rating_count,
                     category_breadcrumb=category_breadcrumb,
                     description=description,
                     material_text=material_text,
@@ -924,9 +650,6 @@ class TargetHandbagsScraper:
                     seller=seller,
                     colors=colors,
                     color_selected=color_selected
-                    ,
-                    add_to_cart_available=add_to_cart_available,
-                    in_stock=in_stock,
                 )
             except Exception as e:
                 last_error = e
@@ -946,40 +669,11 @@ class TargetHandbagsScraper:
         try:
             logger.info(f"Fetching: {url}")
             await page.goto(url, wait_until='domcontentloaded', timeout=60000)
-            # Target's DOM can vary; wait for any selector that reliably indicates product cards.
-            card_selectors = [
-                'div[data-test="product-grid"]',
-                '[data-test="@web/site-top-of-funnel/ProductCardWrapper"]',
-                'a[data-test="@web/ProductCard/title"]',
-                'a[href*="/p/"][href*="/A-"]',
-                'a[href*="/A-"]',
-            ]
-            selector_found = False
-            for selector in card_selectors:
-                try:
-                    await page.wait_for_selector(selector, timeout=30000)
-                    selector_found = True
-                    break
-                except Exception:
-                    continue
-
-            if not selector_found:
-                # Provide quick diagnostics to help understand whether the page is gated/blocked.
-                try:
-                    title = await page.title()
-                    logger.error(f"Listing page did not show product cards. Page title: {title!r} | url: {page.url}")
-                except Exception:
-                    logger.error(f"Listing page did not show product cards. url: {page.url}")
-
-            # Scroll until product links stop increasing (avoids missing lazy-loaded cards)
-            await self._scroll_listing_until_stable(page)
+            await page.wait_for_selector('[data-test="@web/site-top-of-funnel/ProductCardWrapper"]', timeout=60000)
+            # Scroll to trigger lazy loading of images/products
+            await page.evaluate('window.scrollBy(0, window.innerHeight)')
+            await asyncio.sleep(1)
             html = await page.content()
-
-            if not selector_found:
-                # Log a small snippet when blocked pages return unexpected HTML.
-                snippet = re.sub(r'\s+', ' ', html[:400]).strip()
-                if snippet:
-                    logger.error(f"Listing page HTML snippet: {snippet}")
             return html
         except Exception as e:
             logger.error(f"Error fetching listing page: {e}")
@@ -1002,65 +696,17 @@ class TargetHandbagsScraper:
             if not html:
                 return products
             soup = BeautifulSoup(html, 'html.parser')
-
-            # Primary: extract all product links via stable data-test selector
-            link_items = await self._extract_listing_title_links(page)
-            logger.info(f"Found {len(link_items)} product links on page")
-
-            if link_items:
-                for it in link_items:
-                    if self.max_products and len(self.products) + len(products) >= self.max_products:
-                        break
-
-                    raw_href = it.get('href', '')
-                    title = it.get('title', '')
-                    full_url = f"https://www.target.com{raw_href}" if raw_href.startswith('/') else raw_href
-
-                    # Enrich from the card wrapper if present in the HTML snapshot
-                    product: Optional[ProductMetadata] = None
-                    try:
-                        a = soup.find('a', {'data-test': '@web/ProductCard/title', 'href': raw_href})
-                        if a:
-                            wrapper = a.find_parent('div', {'data-test': '@web/site-top-of-funnel/ProductCardWrapper'})
-                            if wrapper:
-                                product = await self._extract_product_card_data(str(wrapper))
-                    except Exception:
-                        product = None
-
-                    if not product:
-                        product_id = self._extract_product_id(raw_href)
-                        product = ProductMetadata(
-                            product_id=product_id,
-                            tcin=product_id,
-                            title=title or "",
-                            url=full_url,
-                        )
-                    else:
-                        # Ensure URL/title are present even if the card parser missed them
-                        if not product.url:
-                            product.url = full_url
-                        if not product.title and title:
-                            product.title = title
-                        if not product.tcin:
-                            product.tcin = product.product_id
-
+            product_cards = soup.find_all('div', {'data-test': '@web/site-top-of-funnel/ProductCardWrapper'})
+            logger.info(f"Found {len(product_cards)} product cards on page")
+            for card in product_cards:
+                if self.max_products and len(self.products) + len(products) >= self.max_products:
+                    break
+                card_html = str(card)
+                product = await self._extract_product_card_data(card_html)
+                if product:
                     products.append(product)
-                    logger.debug(f"Extracted link: {product.title[:50]}...")
-                    await self._random_delay()
-            else:
-                # Secondary: parse card wrappers from HTML snapshot.
-                product_cards = soup.find_all('div', {'data-test': '@web/site-top-of-funnel/ProductCardWrapper'})
-                logger.info(f"Fallback: Found {len(product_cards)} product cards on page")
-                for card in product_cards:
-                    if self.max_products and len(self.products) + len(products) >= self.max_products:
-                        break
-                    product = await self._extract_product_card_data(str(card))
-                    if product:
-                        if not product.tcin:
-                            product.tcin = product.product_id
-                        products.append(product)
-                        logger.debug(f"Extracted: {product.title[:50]}...")
-                    await self._random_delay()
+                    logger.debug(f"Extracted: {product.title[:50]}...")
+                await self._random_delay()
             return products
         except Exception as e:
             logger.error(f"Error scraping listing page: {e}")
@@ -1068,42 +714,79 @@ class TargetHandbagsScraper:
 
     async def get_next_page_url(self, page: Page) -> Optional[str]:
         """
-        Advance to the next listing page using Target's stable pagination controls.
-
-        Primary strategy: click `button[data-test="next"]` and wait for new products.
-        Returns the new page URL, or None if no next page is available.
+        Determine the URL for the next listing page based on the current page's pagination controls.
+        It scrolls to the bottom to ensure the pagination element is loaded and then tries
+        multiple strategies to find the next page URL.
         """
         try:
-            await page.wait_for_selector('[data-test="@web/ProductCard/title"]', timeout=30000)
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            await asyncio.sleep(0.6)
-
-            next_btn = page.locator('button[data-test="next"]')
-            if await next_btn.count() == 0:
+            await asyncio.sleep(0.8)
+            pagination_container = await page.query_selector('div[data-test="listing-page-pagination"]')
+            if not pagination_container:
+                logger.debug("No pagination container found")
                 return None
-            if await next_btn.is_disabled():
-                return None
-
-            prev_url = page.url
-            prev_first = await page.locator('[data-test="@web/ProductCard/title"]').first.get_attribute('href')
-            await next_btn.first.scroll_into_view_if_needed()
-            await next_btn.first.click()
-
-            try:
-                await page.wait_for_function(
-                    """([prevUrl, prevFirst]) => {
-                        const curUrl = location.href;
-                        const curFirst = (document.querySelector('[data-test="@web/ProductCard/title"]')?.getAttribute('href') || '');
-                        return curUrl !== prevUrl || curFirst !== (prevFirst || '');
-                    }""",
-                    arg=[prev_url, prev_first or ""],
-                    timeout=30000,
-                )
-            except Exception:
-                pass
-
-            await self._scroll_listing_until_stable(page)
-            return page.url
+            # Method 1: handle next button with JS offset
+            next_button = await page.query_selector('button[data-test="next"]')
+            if next_button:
+                disabled = await next_button.get_attribute('disabled')
+                if disabled is None:
+                    current_url = page.url
+                    page_selector_text = await page.query_selector('span.styles_span__c6JxQ')
+                    if page_selector_text:
+                        text = await page_selector_text.inner_text()
+                        match = re.search(r'page\s+(\d+)\s+of\s+(\d+)', text, re.I)
+                        if match:
+                            current_page = int(match.group(1))
+                            total_pages = int(match.group(2))
+                            if current_page < total_pages:
+                                next_page_num = current_page + 1
+                                if '?' in current_url:
+                                    parsed = urlparse(current_url)
+                                    query_params = parse_qs(parsed.query)
+                                    query_params['Nao'] = [str((next_page_num - 1) * 24)]
+                                    new_query = urlencode(query_params, doseq=True)
+                                    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
+                                else:
+                                    return f"{current_url}?Nao={(next_page_num - 1) * 24}"
+                    if 'Nao=' in current_url:
+                        match = re.search(r'Nao=(\d+)', current_url)
+                        if match:
+                            current_offset = int(match.group(1))
+                            next_offset = current_offset + 24
+                            return current_url.replace(f'Nao={current_offset}', f'Nao={next_offset}')
+                    else:
+                        return f"{current_url}?Nao=24" if '?' not in current_url else f"{current_url}&Nao=24"
+            # Fallbacks using anchor tags
+            selectors = [
+                'a[aria-label="Go to next page"]',
+                'a[aria-label*="next" i]',
+                'nav[aria-label*="pagination" i] a[rel="next"]',
+                'a[data-test*="pagination" i][href*="page"]',
+                'a[href*="Ntt="][href*="page="]',
+            ]
+            for sel in selectors:
+                next_el = await page.query_selector(sel)
+                if next_el:
+                    href = await next_el.get_attribute('href')
+                    if href and ('page' in href or 'Nao=' in href or 'next' in href.lower()):
+                        return f"https://www.target.com{href}" if href.startswith('/') else href
+            # Dropdown fallback
+            page_text_elem = await page.query_selector('button[data-test="select"] span.styles_span__c6JxQ')
+            if page_text_elem:
+                text = await page_text_elem.inner_text()
+                match = re.search(r'page\s+(\d+)\s+of\s+(\d+)', text, re.I)
+                if match:
+                    current_page = int(match.group(1))
+                    total_pages = int(match.group(2))
+                    if current_page < total_pages:
+                        current_url = page.url
+                        next_offset = current_page * 24
+                        if 'Nao=' in current_url:
+                            return current_url.replace(re.search(r'Nao=\d+', current_url).group(), f'Nao={next_offset}')
+                        else:
+                            sep = '&' if '?' in current_url else '?'
+                            return f"{current_url}{sep}Nao={next_offset}"
+            return None
         except Exception as e:
             logger.error(f"Error getting next page URL: {e}")
             return None
@@ -1166,8 +849,6 @@ class TargetHandbagsScraper:
                             product.seller = detail.seller or product.seller
                             product.category_breadcrumb = detail.category_breadcrumb or product.category_breadcrumb
                             product.material_text = detail.material_text or product.material_text
-                            if detail.tcin:
-                                product.tcin = detail.tcin
                             if detail.sale_price > 0:
                                 product.sale_price = detail.sale_price
                             if detail.colors:
@@ -1178,14 +859,6 @@ class TargetHandbagsScraper:
                                 product.price_regular = detail.price_regular
                             if detail.color_selected:
                                 product.color_selected = detail.color_selected
-                            if detail.brand:
-                                product.brand = detail.brand
-                            if detail.rating > 0:
-                                product.rating = detail.rating
-                            if detail.rating_count > 0:
-                                product.rating_count = detail.rating_count
-                            product.add_to_cart_available = detail.add_to_cart_available
-                            product.in_stock = detail.in_stock
                         await self._random_delay()
                 # Determine next page
                 current_url = await self.get_next_page_url(listing_page)
@@ -1263,22 +936,17 @@ async def main():
     parser.add_argument('--max-products', type=int, default=None, help='Maximum products to scrape')
     parser.add_argument('--delay-min', type=float, default=1.5, help='Minimum delay between requests')
     parser.add_argument('--delay-max', type=float, default=3.0, help='Maximum delay between requests')
-    parser.add_argument('--headless', action='store_true', default=True, help='Run in headless mode (default)')
-    parser.add_argument('--headed', action='store_true', help='Run with a visible browser window (sets headless=False)')
+    parser.add_argument('--headless', action='store_true', default=True, help='Run in headless mode')
     parser.add_argument('--verbose', action='store_true', help='Verbose logging')
     parser.add_argument('--details', action='store_true', help='Extract detailed product info')
-    parser.add_argument('--allow-proxy', action='store_true', help='Allow inheriting proxy env vars (default: proxies disabled)')
     parser.add_argument('--output-dir', default='../output', help='Output directory')
     args = parser.parse_args()
-    if args.headed:
-        args.headless = False
     scraper = TargetHandbagsScraper(
         max_products=args.max_products,
         delay_min=args.delay_min,
         delay_max=args.delay_max,
         headless=args.headless,
-        verbose=args.verbose,
-        allow_proxy=args.allow_proxy,
+        verbose=args.verbose
     )
     await scraper.scrape(include_details=args.details)
     scraper.save_all(args.output_dir)
