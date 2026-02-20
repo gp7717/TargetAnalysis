@@ -1,1297 +1,409 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """
-Advanced Target Handbags Scraper with robust metadata extraction and pagination support.
-Extracts comprehensive product information from listing and detail pages.
-
-This script uses Playwright to navigate Target's handbags category, parse product
-cards, and optionally visit individual product pages for detailed data. It
-supports pagination, random delays between requests, and can save results in
-JSON, JSONL, or CSV formats. The code has been enhanced to handle
-edge‑cases discovered while scraping dynamic content (e.g., expanded
-specifications, fallback selectors) and improved error handling for robust
-operation.
-
-Example usage:
-
-```
-python target_handbags_scraper.py --max-products 50 --details --output-dir ./data
-```
-
-This will scrape up to 50 handbags from Target, including detail pages, and
-save the outputs into the `./data` directory.
+Target Handbags Scraper – 2025 edition
+Hardcoded proxy + anti-bot hardening + debug output
 """
 
 import asyncio
 import json
 import logging
+import random
 import re
-import csv
-import os
-from typing import Dict, List, Optional, Any, Tuple
+from contextlib import suppress
+from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from pathlib import Path
-from dataclasses import dataclass, asdict, field
-from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
-import random
+from typing import List, Optional, Dict, Any
 
-from playwright.async_api import async_playwright, Page, Browser, BrowserContext, Playwright
+from playwright.async_api import async_playwright, Page, BrowserContext
 from bs4 import BeautifulSoup
 
-# Configure logging
+# Logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s | %(levelname)-7s | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("target-scraper")
 
 
 @dataclass
-class ProductMetadata:
-    """Data class for product metadata"""
-    product_id: str
+class Product:
+    tcin: str
     title: str
     url: str
-    tcin: str = ""
     brand: str = ""
-    price_current: float = 0.0
-    price_regular: float = 0.0
-    sale_price: float = 0.0
-    discount_percent: int = 0
-    discount_amount: float = 0.0
+    price: float = 0.0
+    original_price: float = 0.0
     rating: float = 0.0
-    rating_count: int = 0
-    bought_last_month: str = ""
+    review_count: int = 0
+    bought_recently: str = ""
     colors: List[str] = field(default_factory=list)
-    color_selected: str = ""
-    category_breadcrumb: str = ""
-    description: str = ""
-    material_text: str = ""
-    highlights: List[str] = field(default_factory=list)
-    feature_bullets: List[str] = field(default_factory=list)
+    selected_color: str = ""
     images: List[str] = field(default_factory=list)
+    description: str = ""
+    material: str = ""
     dimensions: Dict[str, str] = field(default_factory=dict)
-    dimensions_table: Dict[str, str] = field(default_factory=dict)
-    specifications: Dict[str, str] = field(default_factory=dict)
-    is_sale: bool = False
-    is_clearance: bool = False
-    is_new: bool = False
-    best_seller: bool = False
-    seller: str = ""
-    fulfillment_info: str = ""
-    add_to_cart_available: bool = False
+    specs: Dict[str, str] = field(default_factory=dict)
+    is_on_sale: bool = False
     in_stock: bool = True
     scraped_at: str = field(default_factory=lambda: datetime.now().isoformat())
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for JSON serialization"""
-        data = asdict(self)
-        # Flatten lists into pipe-separated strings for CSV compatibility
-        data['colors'] = '|'.join(self.colors) if self.colors else ""
-        data['highlights'] = '|'.join(self.highlights) if self.highlights else ""
-        data['feature_bullets'] = '|'.join(self.feature_bullets) if self.feature_bullets else ""
-        data['images'] = '|'.join(self.images) if self.images else ""
-        # Serialize dict fields to JSON strings for CSV/JSONL
-        data['dimensions'] = json.dumps(self.dimensions) if self.dimensions else "{}"
-        data['dimensions_table'] = json.dumps(self.dimensions_table) if self.dimensions_table else "{}"
-        data['specifications'] = json.dumps(self.specifications) if self.specifications else "{}"
-        return data
+        d = asdict(self)
+        d['colors'] = ', '.join(self.colors)
+        d['images'] = ', '.join(self.images[:8])
+        d['dimensions'] = json.dumps(self.dimensions, ensure_ascii=False)
+        d['specs'] = json.dumps(self.specs, ensure_ascii=False)
+        return d
 
 
 class TargetHandbagsScraper:
-    """
-    Advanced scraper for Target handbags with pagination and detail extraction.
-
-    This class encapsulates all scraping logic. You can set a maximum number of
-    products to scrape, configure random delay intervals, choose headless mode,
-    and enable verbose logging. The scraper can also optionally extract
-    additional details from individual product pages.
-    """
-
     def __init__(
         self,
         max_products: Optional[int] = None,
-        delay_min: float = 1.0,
-        delay_max: float = 3.0,
+        delay_range: tuple[float, float] = (2.5, 6.0),
         headless: bool = True,
         verbose: bool = False,
-        allow_proxy: bool = False,
+        get_details: bool = False,
+        output_dir: str = "./output"
     ):
-        """
-        Initialize the scraper.
-
-        Args:
-            max_products: Maximum number of products to scrape (None for all)
-            delay_min: Minimum delay between requests in seconds
-            delay_max: Maximum delay between requests in seconds
-            headless: Run browser in headless mode
-            verbose: Enable verbose logging
-        """
         self.max_products = max_products
-        self.delay_min = delay_min
-        self.delay_max = delay_max
+        self.delay_min, self.delay_max = delay_range
         self.headless = headless
         self.verbose = verbose
-        self.allow_proxy = allow_proxy
-        self.products: List[ProductMetadata] = []
-        self.base_url = "https://www.target.com/c/handbags-purses-accessories/-/N-5xtbo"
-        self.playwright: Optional[Playwright] = None
-        self.browser: Optional[Browser] = None
-        self.context: Optional[BrowserContext] = None
+        self.get_details = get_details
+        self.output_dir = Path(output_dir).expanduser().resolve()
 
         if verbose:
             logger.setLevel(logging.DEBUG)
 
-    async def setup(self):
-        """Setup browser and context"""
-        self.playwright = await async_playwright().start()
+        self.products: List[Product] = []
+        self.base_url = "https://www.target.com/c/handbags-purses-accessories/-/N-5xtbo"
 
-        launch_env = os.environ.copy()
-        launch_args: List[str] = []
-        if not self.allow_proxy:
-            # Ensure Playwright's Chromium process does not inherit any proxy settings.
-            # This handles cases where HTTP(S)_PROXY/ALL_PROXY are set in the shell.
-            for key in (
-                'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
-                'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy',
-            ):
-                launch_env.pop(key, None)
-            # Explicitly disable proxy at the Chromium layer too.
-            launch_args.extend(['--no-proxy-server', '--proxy-bypass-list=*'])
-            logger.info("Proxy disabled (env + Chromium args)")
+        # ─── HARDCODED PROXY ────────────────────────────────────────────────
+        self.proxy_host_port = "104.238.30.50:59741"
+        self.proxy = f"http://{self.proxy_host_port}"
+        logger.info(f"Proxy hardcoded: {self.proxy}")
 
-        self.browser = await self.playwright.chromium.launch(
-            headless=self.headless,
-            args=launch_args or None,
-            env=launch_env,
+    async def _delay(self):
+        await asyncio.sleep(random.uniform(self.delay_min, self.delay_max))
+
+    async def _init_browser(self) -> tuple[BrowserContext, Page]:
+        pw = await async_playwright().start()
+        browser = await pw.chromium.launch(headless=self.headless)
+
+        user_agents = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+        ]
+
+        context = await browser.new_context(
+            user_agent=random.choice(user_agents),
+            viewport={"width": 1366, "height": 768},
+            proxy={"server": self.proxy}
         )
-        self.context = await self.browser.new_context(
-            ignore_https_errors=True,
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/118.0.5993.0 Safari/537.36"
-            ),
-            locale="en-US"
-        )
-        logger.info("Browser setup complete")
 
-    async def cleanup(self):
-        """
-        Cleanup browser resources (order matters on Windows to avoid closed-pipe errors).
-        Always call this when done to gracefully close the browser and playwright.
-        """
-        try:
-            if self.context:
-                await self.context.close()
-                self.context = None
-            if self.browser:
-                await self.browser.close()
-                self.browser = None
-            if self.playwright:
-                await self.playwright.stop()
-                self.playwright = None
-            await asyncio.sleep(0.25)  # let event loop finish transports on Windows
-        except Exception as e:
-            logger.debug(f"Cleanup: {e}")
-        logger.info("Browser cleanup complete")
+        page = await context.new_page()
 
-    async def _random_delay(self):
-        """Add random delay between requests"""
-        delay = random.uniform(self.delay_min, self.delay_max)
-        await asyncio.sleep(delay)
+        logger.info("Browser initialized with proxy")
+        return context, page
 
-    async def _scroll_listing_until_stable(
-        self,
-        page: Page,
-        *,
-        max_scrolls: int = 24,
-        stable_rounds: int = 3,
-        selector: str = '[data-test="@web/ProductCard/title"]',
-    ) -> None:
-        """Scroll a listing page until product links stop increasing.
-
-        Target frequently lazy-loads cards; snapshotting HTML too early can miss
-        products. This method scrolls in steps and stops when the number of title
-        links stabilizes for a few rounds.
-        """
-        try:
-            await page.wait_for_selector(selector, timeout=30000)
-        except Exception:
-            return
-
-        last_count = -1
-        stable = 0
-        locator = page.locator(selector)
-
-        for _ in range(max_scrolls):
-            try:
-                count = await locator.count()
-            except Exception:
-                count = last_count
-
-            if count == last_count:
-                stable += 1
-            else:
-                stable = 0
-                last_count = count
-
-            if stable >= stable_rounds:
-                break
-
-            try:
-                await page.evaluate('window.scrollBy(0, Math.max(window.innerHeight * 1.25, 900))')
-            except Exception:
-                break
-            await asyncio.sleep(0.9)
-
-    async def _extract_listing_title_links(self, page: Page) -> List[Dict[str, str]]:
-        """Extract all product title links on the current listing page.
-
-        Uses Target's stable data-test attribute on the title <a>.
-        Returns list items: {"href": <raw href>, "title": <text>}.
-        """
-        try:
-            items: List[Dict[str, str]] = await page.evaluate(
-                """() => {
-                    const sel = '[data-test="@web/ProductCard/title"]';
-                    const nodes = Array.from(document.querySelectorAll(sel));
-                    return nodes.map(a => ({
-                        href: (a.getAttribute('href') || '').trim(),
-                        title: (a.textContent || '').trim(),
-                    }));
-                }"""
-            )
-        except Exception:
-            return []
-
-        cleaned: List[Dict[str, str]] = []
-        for it in items or []:
-            href = (it.get('href') or '').strip()
-            if not href:
-                continue
-            # Target product PDP URLs include /A-<TCIN>
-            if '/A-' not in href:
-                continue
-            cleaned.append({'href': href, 'title': (it.get('title') or '').strip()})
-
-        if cleaned:
-            return cleaned
-
-        # Fallback: extract any product links within the product grid.
-        # This is less stable than data-test, but helps when Target A/B tests the DOM.
-        try:
-            items2: List[Dict[str, str]] = await page.evaluate(
-                """() => {
-                    const root = document.querySelector('div[data-test="product-grid"]') || document;
-                    const nodes = Array.from(root.querySelectorAll('a[href^="/p/"][href*="/A-"]'));
-                    return nodes.map(a => ({
-                        href: (a.getAttribute('href') || '').trim(),
-                        title: (a.textContent || a.getAttribute('aria-label') || '').trim(),
-                    }));
-                }"""
-            )
-        except Exception:
-            items2 = []
-
-        for it in items2 or []:
-            href = (it.get('href') or '').strip()
-            if not href or '/A-' not in href:
-                continue
-            cleaned.append({'href': href, 'title': (it.get('title') or '').strip()})
-
-        return cleaned
-
-    async def _extract_product_card_data(self, card_html: str) -> Optional[ProductMetadata]:
-        """
-        Extract product data from a product card HTML.
-        This method is designed to be resilient to changes in the card's DOM
-        structure by using multiple fallback selectors.
-
-        Args:
-            card_html: HTML string of the product card
-
-        Returns:
-            ProductMetadata instance if extraction is successful, otherwise None.
-        """
-        try:
-            soup = BeautifulSoup(card_html, 'html.parser')
-
-            # Extract product ID and URL (multiple fallbacks for different card layouts)
-            title_link = soup.find('a', {'data-test': '@web/ProductCard/title'})
-            if not title_link:
-                title_link = soup.select_one('a[href*="/p/"][href*="/A-"]')
-            if not title_link:
-                title_link = soup.find('a', href=re.compile(r'/p/.*/A-\d+'))
-            if not title_link:
-                title_link = soup.find('a', href=re.compile(r'/A-\d+'))
-            if not title_link:
-                return None
-
-            product_url = (title_link.get('href') or '').strip()
-            if not product_url or '/A-' not in product_url:
-                return None
-            product_id = self._extract_product_id(product_url)
-            title = title_link.get_text(strip=True) or title_link.get('aria-label') or title_link.get('title') or ""
-            if not title:
-                # Heuristic: search for any textual content that could be the title
-                title = ""
-                for tag in soup.find_all(['h2', 'h3', 'span', 'div']):
-                    t = tag.get_text(strip=True)
-                    if t and len(t) > 3 and len(t) < 200 and not re.match(r'^\$[\d,.]+$', t):
-                        title = t
-                        break
-            if not title:
-                return None
-
-            # Extract brand
-            brand_link = soup.find('a', {'data-test': '@web/ProductCard/ProductCardBrandAndRibbonMessage/brand'})
-            brand = brand_link.get_text(strip=True) if brand_link else ""
-            if not brand:
-                brand_link = soup.find('a', attrs={'data-test': re.compile(r'brand', re.I)})
-                brand = brand_link.get_text(strip=True) if brand_link else brand
-
-            # Extract pricing
-            current_price_elem = soup.find('span', {'data-test': 'current-price'})
-            current_price = self._parse_price(current_price_elem.get_text(strip=True) if current_price_elem else "0")
-            if current_price == 0.0:
-                # Fallback for variants where price is not tagged as current-price
-                price_like = soup.find(string=re.compile(r'\$\s*\d'))
-                if price_like:
-                    current_price = self._parse_price(str(price_like))
-
-            # Extract regular price
-            regular_price_elem = soup.find('span', {'data-test': 'comparison-price'})
-            regular_price = 0.0
-            if regular_price_elem:
-                price_text = regular_price_elem.get_text(strip=True)
-                match = re.search(r'\$([0-9,.]+)', price_text)
-                if match:
-                    regular_price = self._parse_price(match.group(1))
-
-            # Calculate discount
-            discount_percent = 0
-            discount_amount = 0.0
-            if regular_price > current_price and regular_price > 0:
-                discount_amount = regular_price - current_price
-                discount_percent = int((discount_amount / regular_price) * 100)
-
-            # Extract rating - look for aria-hidden="true" span that contains numeric rating
-            rating = 0.0
-            rating_count = 0
-            rating_container = soup.find('div', class_='styles_ndsRatingStars__uEZcs')
-            if rating_container:
-                rating_spans = rating_container.find_all('span', {'aria-hidden': 'true'})
-                for span in rating_spans:
-                    text = span.get_text(strip=True)
-                    try:
-                        rating_val = float(text)
-                        if 0 <= rating_val <= 5:  # Valid rating range
-                            rating = rating_val
-                            break
-                    except (ValueError, AttributeError):
-                        continue
-                # Find rating count
-                rating_count_elem = rating_container.find('span', class_='styles_ratingCount__QDWQY')
-                if not rating_count_elem:
-                    rating_count_elem = rating_container.find('span', {'aria-label': re.compile(r'\d+\s+ratings?', re.I)})
-                if rating_count_elem:
-                    try:
-                        count_text = rating_count_elem.get_text(strip=True)
-                        match = re.search(r'(\d+)', count_text)
-                        if match:
-                            rating_count = int(match.group(1))
-                    except (ValueError, AttributeError):
-                        pass
-            else:
-                # Fallback: look for any aria-hidden span with rating
-                rating_elem = soup.find('span', {'aria-hidden': 'true'})
-                if rating_elem:
-                    try:
-                        rating = float(rating_elem.get_text(strip=True))
-                    except (ValueError, AttributeError):
-                        pass
-                rating_count_elem = soup.find('span', class_='styles_ratingCount__QDWQY')
-                if rating_count_elem:
-                    try:
-                        count_text = rating_count_elem.get_text(strip=True)
-                        match = re.search(r'(\d+)', count_text)
-                        if match:
-                            rating_count = int(match.group(1))
-                    except (ValueError, AttributeError):
-                        pass
-
-            # Extract "bought in last month" info
-            bought_text = ""
-            strong_tags = soup.find_all('strong')
-            if strong_tags and len(strong_tags) > 0:
-                bought_text = strong_tags[0].get_text(strip=True)
-
-            # Extract colors
-            colors: List[str] = []
-            color_swatches = soup.find('span', {'data-test': '@web/ProductCard/ProductCardSwatches'})
-            if color_swatches:
-                color_aria = color_swatches.get('aria-label', '')
-                if color_aria:
-                    colors = [c.strip() for c in color_aria.split(',') if c.strip()]
-
-            # Primary image URL from card
-            card_images: List[str] = []
-            primary_picture = soup.find('picture', {'data-test': '@web/ProductCard/ProductCardImage/primary'})
-            if primary_picture:
-                img = primary_picture.find('img', src=True)
-                if img and img.get('src'):
-                    card_images.append(img['src'].split('?')[0] + '?wid=800&hei=800&qlt=80&fmt=pjpeg')
-                else:
-                    first_source = primary_picture.find('source', srcset=True)
-                    if first_source and first_source.get('srcset'):
-                        srcset = first_source['srcset'].split(',')[0].strip().split()[0]
-                        if srcset:
-                            card_images.append(srcset)
-
-            # Best-seller flag: stable selector
-            best_seller = False
-            bestseller_elem = soup.find(attrs={'aria-label': lambda x: x and 'bestseller' in (x or '').lower()})
-            if bestseller_elem or (soup.find(string=re.compile(r'Bestseller', re.I))):
-                best_seller = True
-
-            # New-arrival flag: "New at target" in brand/ribbon area
-            is_new = False
-            brand_ribbon = soup.find('div', class_=lambda c: c and 'brandAndRibbonWrapper' in str(c))
-            if brand_ribbon and 'new at' in (brand_ribbon.get_text() or '').lower():
-                is_new = True
-            if not is_new and re.search(r'New at\s+target', card_html, re.I):
-                is_new = True
-
-            # Sale/clearance
-            is_sale = bool(soup.find('span', {'data-test': 'current-price'}) and 'sale' in card_html.lower())
-            is_clearance = 'clearance' in card_html.lower()
-            if not is_sale and regular_price > 0 and current_price < regular_price:
-                is_sale = True
-
-            return ProductMetadata(
-                product_id=product_id,
-                title=title,
-                url=f"https://www.target.com{product_url}" if product_url.startswith('/') else product_url,
-                brand=brand,
-                price_current=current_price,
-                price_regular=regular_price,
-                discount_percent=discount_percent,
-                discount_amount=discount_amount,
-                rating=rating,
-                rating_count=rating_count,
-                bought_last_month=bought_text,
-                colors=colors,
-                images=card_images,
-                is_sale=is_sale,
-                is_clearance=is_clearance,
-                is_new=is_new,
-                best_seller=best_seller
-            )
-        except Exception as e:
-            logger.error(f"Error extracting product card data: {e}")
-            return None
-
-    async def _expand_specifications_if_present(self, page: Page) -> None:
-        """
-        Expand "About this item" and "Specifications" collapsible sections on product pages.
-        Many Target product pages hide important details behind collapsibles. This helper
-        clicks on them and waits for the content to load.
-        """
-        try:
-            # Expand "About this item"
-            about_section = await page.query_selector('[data-test*="ProductDetailCollapsible-AboutThisItem"], [data-test*="AboutThisItem"]')
-            if about_section:
-                about_btn = await about_section.query_selector('button')
-                if about_btn:
-                    expanded = await about_btn.get_attribute('aria-expanded')
-                    if expanded != 'true':
-                        await about_btn.scroll_into_view_if_needed()
-                        await about_btn.click()
-                        await asyncio.sleep(0.4)
-
-            # Expand "Specifications"
-            spec_section = await page.query_selector('[data-test*="ProductDetailCollapsible-Specifications"]')
-            if not spec_section:
-                # Fallback: click button with text "Specifications"
-                try:
-                    spec_locator = page.locator('button').filter(has_text=re.compile(r'Specifications', re.I))
-                    if await spec_locator.count() > 0:
-                        first_btn = spec_locator.first
-                        expanded = await first_btn.get_attribute('aria-expanded')
-                        if expanded != 'true':
-                            await first_btn.scroll_into_view_if_needed()
-                            await first_btn.click()
-                            await asyncio.sleep(0.5)
-                except Exception:
-                    pass
-            else:
-                spec_btn = await spec_section.query_selector('button')
-                if spec_btn:
-                    expanded = await spec_btn.get_attribute('aria-expanded')
-                    if expanded != 'true':
-                        await spec_btn.scroll_into_view_if_needed()
-                        await spec_btn.click()
-                        await asyncio.sleep(0.5)
-            # Wait for the spec content
-            try:
-                await page.wait_for_selector(
-                    'div[data-test="item-details-specifications"]',
-                    state='visible',
-                    timeout=5000
-                )
-                await asyncio.sleep(0.3)
-            except Exception:
-                pass
-        except Exception as e:
-            logger.debug(f"Could not expand Specifications: {e}")
-
-    def _parse_specifications_section(self, soup: BeautifulSoup) -> Tuple[Dict[str, str], Dict[str, str], str]:
-        """
-        Parse the Specifications section of a product page.
-        Returns a tuple of (dimensions_table, specifications, material_text).
-
-        The method looks for a container with data-test="item-details-specifications" and
-        extracts key/value pairs. It also identifies dimension keys for easier access
-        and returns the material text separately.
-        """
-        dimensions_table: Dict[str, str] = {}
-        specifications: Dict[str, str] = {}
-        material_text = ""
-
-        # Locate the specifications container
-        spec_container = soup.find('div', {'data-test': 'item-details-specifications'})
-        if not spec_container:
-            collapsible = soup.find(attrs={'data-test': re.compile(r'ProductDetailCollapsible-Specifications')})
-            if collapsible:
-                content_div = collapsible.find('div', {'data-test': 'collapsibleContentDiv'})
-                if content_div:
-                    spec_container = content_div.find('div', {'data-test': 'item-details-specifications'})
-        if not spec_container:
-            candidates = [
-                d for d in soup.find_all('div')
-                if ('Dimensions (Overall):' in d.get_text() or 'TCIN:' in d.get_text())
-                and len(d.find_all('b')) >= 2
-            ]
-            if candidates:
-                spec_container = min(candidates, key=lambda d: len(d.get_text()))
-        if not spec_container:
-            return dimensions_table, specifications, material_text
-
-        def _parse_spec_row(block) -> None:
-            """Parse a single row within specifications"""
-            b = block.find('b')
-            if not b:
-                return
-            key = b.get_text(strip=True).rstrip(':').strip()
-            if not key:
-                return
-            full_text = block.get_text(separator=' ', strip=True)
-            if ':' not in full_text:
-                return
-            value = full_text.split(':', 1)[1].strip()
-            if not value or len(value) > 1000:
-                return
-            specifications[key] = value
-
-        # Parse direct children
-        for div in spec_container.find_all('div', recursive=False):
-            if div.get('data-test') == 'itemDetailsTabMarketplaceMessage':
-                break
-            _parse_spec_row(div)
-        # Fallback: nested divs
-        if not specifications:
-            for block in spec_container.find_all('div'):
-                if block is spec_container:
-                    continue
-                if block.get('data-test') == 'itemDetailsTabMarketplaceMessage':
-                    break
-                _parse_spec_row(block)
-
-        # Extract dimension and material keys
-        for key, value in list(specifications.items()):
-            key_lower = key.lower()
-            if 'dimensions' in key_lower and 'overall' in key_lower:
-                dimensions_table['dimensions_overall'] = value
-            elif 'height' in key_lower:
-                dimensions_table['height'] = value
-            elif 'width' in key_lower:
-                dimensions_table['width'] = value
-            elif 'depth' in key_lower:
-                dimensions_table['depth'] = value
-            elif 'material' in key_lower or 'shell' in key_lower:
-                material_text = value
-        if not material_text:
-            for k, v in specifications.items():
-                if 'material' in k.lower():
-                    material_text = v
-                    break
-
-        return dimensions_table, specifications, material_text
-
-    async def _extract_product_detail(self, page: Page, product_url: str) -> Optional[ProductMetadata]:
-        """
-        Extract detailed information from a product page.
-        It visits the product URL, waits for the page to load, expands any hidden
-        sections, and then parses the HTML for details like category breadcrumb,
-        description, highlights, specifications, and images.
-
-        Args:
-            page: Playwright Page object
-            product_url: URL of the product page
-
-        Returns:
-            ProductMetadata with detailed fields populated, or None on error.
-        """
-        last_error = None
-        for attempt in range(2):  # attempt one retry on timeout
-            try:
-                await self._random_delay()
-                page.set_default_timeout(60000)
-                await page.goto(product_url, wait_until='domcontentloaded', timeout=60000)
-                await page.wait_for_selector('h1[data-test="product-title"]', timeout=60000)
-
-                # Expand collapsible sections
-                await self._expand_specifications_if_present(page)
-
-                html = await page.content()
-                soup = BeautifulSoup(html, 'html.parser')
-
-                title_elem = soup.find('h1', {'data-test': 'product-title'})
-                title = title_elem.get_text(strip=True) if title_elem else ""
-                product_id = self._extract_product_id(product_url)
-
-                # Brand (data-test first)
-                brand = ""
-                brand_link = soup.find('a', {'data-test': 'shopAllBrandLink'})
-                if brand_link:
-                    brand = brand_link.get_text(strip=True).replace('Shop all', '').strip()
-
-                # Prices
-                price_elem = soup.find('span', {'data-test': 'product-price'})
-                current_price = self._parse_price(price_elem.get_text(strip=True) if price_elem else "0")
-                regular_price_elem = soup.find('span', {'data-test': 'product-regular-price'})
-                regular_price = 0.0
-                if regular_price_elem:
-                    match = re.search(r'\$([0-9,.]+)', regular_price_elem.get_text(strip=True))
-                    if match:
-                        regular_price = self._parse_price(match.group(1))
-                sale_price = current_price if (regular_price > 0 and current_price < regular_price) else 0.0
-
-                # Add-to-cart / stock signal (data-test first)
-                add_to_cart_available = False
-                in_stock = True
-                atc_btn = soup.find('button', {'data-test': 'shippingButton'})
-                if atc_btn:
-                    disabled = atc_btn.has_attr('disabled') or (atc_btn.get('aria-disabled') == 'true')
-                    add_to_cart_available = not disabled
-                    in_stock = not disabled
-
-                # Category breadcrumb
-                category_breadcrumb = ""
-                breadcrumb_module = soup.find('div', {'data-module-type': 'ProductDetailBreadcrumbs'})
-                nav = soup.find('nav', {'aria-label': 'Breadcrumbs'}) if not breadcrumb_module else breadcrumb_module.find('nav', {'aria-label': 'Breadcrumbs'})
-                if not nav:
-                    nav = soup.find('nav', {'data-test': '@web/Breadcrumbs/BreadcrumbNav'})
-                if nav:
-                    links = nav.find_all('a', {'data-test': '@web/Breadcrumbs/BreadcrumbLink'})
-                    if not links:
-                        links = nav.find_all('a')
-                    category_breadcrumb = ' > '.join(a.get_text(strip=True) for a in links if a.get_text(strip=True))
-
-                # Image gallery
-                images: List[str] = []
-                # Preferred: stable data-test gallery items
-                for img in soup.select('[data-test^="image-gallery-item-"] img'):
-                    src = (img.get('src') or '').strip()
-                    if src and 'target.scene7.com' in src and src not in images:
-                        # Normalize to higher-res where possible
-                        src = re.sub(r'wid=\d+', 'wid=1200', src)
-                        src = re.sub(r'hei=\d+', 'hei=1200', src)
-                        images.append(src)
-
-                gallery = soup.find('section', {'aria-label': 'Image gallery'})
-                if gallery and not images:
-                    for img in gallery.find_all('img', src=True):
-                        src = img.get('src')
-                        if src and 'target.scene7.com' in src:
-                            if src not in images:
-                                images.append(src)
-                if not images:
-                    for elem in soup.find_all(attrs={'data-test': re.compile(r'image-gallery-item')}):
-                        img = elem.find('img', src=True)
-                        if img and img.get('src') and 'target.scene7.com' in img.get('src', ''):
-                            src = img['src']
-                            if src not in images:
-                                images.append(src)
-                images = images[:15]
-
-                # Highlights
-                highlights: List[str] = []
-                # Preferred: stable data-test highlights block
-                for li in soup.select('[data-test="@web/ProductDetailPageHighlights"] ul li'):
-                    t = li.get_text(strip=True)
-                    if t:
-                        highlights.append(t)
-                if not highlights:
-                    highlights_section = soup.find('div', {'id': 'PdpHighlightsSection'})
-                    if highlights_section:
-                        for li in highlights_section.find_all('li'):
-                            t = li.get_text(strip=True)
-                            if t:
-                                highlights.append(t)
-                feature_bullets = list(highlights)
-
-                # Rating + count (data-test first; fallback to JSON-LD / DOM)
-                rating = 0.0
-                rating_count = 0
-                try:
-                    rating_count_span = soup.select_one('a[data-test="ratingCountLink"] span')
-                    if rating_count_span:
-                        m = re.search(r'(\d[\d,]*)', rating_count_span.get_text(strip=True))
-                        if m:
-                            rating_count = int(m.group(1).replace(',', ''))
-                except Exception:
-                    pass
-
-                def _parse_json_ld_aggregate_rating() -> Tuple[float, int]:
-                    for script in soup.find_all('script', attrs={'type': 'application/ld+json'}):
-                        raw = (script.string or '').strip()
-                        if not raw:
-                            continue
-                        try:
-                            obj = json.loads(raw)
-                        except Exception:
-                            continue
-
-                        candidates: List[Any] = []
-                        if isinstance(obj, list):
-                            candidates.extend(obj)
-                        else:
-                            candidates.append(obj)
-
-                        for c in candidates:
-                            if not isinstance(c, dict):
-                                continue
-                            # Sometimes JSON-LD uses @graph
-                            graph = c.get('@graph')
-                            if isinstance(graph, list):
-                                candidates.extend([g for g in graph if isinstance(g, dict)])
-
-                            if c.get('@type') not in ('Product', 'ProductGroup'):
-                                continue
-                            ar = c.get('aggregateRating')
-                            if not isinstance(ar, dict):
-                                continue
-                            rv = ar.get('ratingValue')
-                            rc = ar.get('ratingCount') or ar.get('reviewCount')
-                            try:
-                                rv_f = float(str(rv)) if rv is not None else 0.0
-                            except Exception:
-                                rv_f = 0.0
-                            try:
-                                rc_i = int(str(rc).replace(',', '')) if rc is not None else 0
-                            except Exception:
-                                rc_i = 0
-                            if rv_f or rc_i:
-                                return rv_f, rc_i
-                    return 0.0, 0
-
-                if rating == 0.0 or rating_count == 0:
-                    rv_f, rc_i = _parse_json_ld_aggregate_rating()
-                    if rating == 0.0 and rv_f:
-                        rating = rv_f
-                    if rating_count == 0 and rc_i:
-                        rating_count = rc_i
-
-                if rating == 0.0:
-                    # Last resort: hashed star container (may change)
-                    rating_container = soup.find('div', class_='styles_ndsRatingStars__uEZcs')
-                    if rating_container:
-                        for span in rating_container.find_all('span', {'aria-hidden': 'true'}):
-                            txt = span.get_text(strip=True)
-                            try:
-                                val = float(txt)
-                                if 0 <= val <= 5:
-                                    rating = val
-                                    break
-                            except Exception:
-                                continue
-
-                # Specifications
-                dimensions_table, specifications, material_text = self._parse_specifications_section(soup)
-
-                # TCIN explicit (promote from specs if present)
-                tcin = ""
-                for k, v in specifications.items():
-                    if k.strip().lower() == 'tcin':
-                        tcin = v.strip()
-                        break
-                if not tcin:
-                    tcin = product_id
-                dimensions: Dict[str, str] = {}
-                for highlight in highlights:
-                    if 'measurements' in highlight.lower():
-                        dimensions['measurements'] = highlight
-                    elif 'drop' in highlight.lower():
-                        dimensions['handle_drop'] = highlight
-                for k, v in dimensions_table.items():
-                    dimensions[k] = v
-                if not material_text and specifications:
-                    for k, v in specifications.items():
-                        if 'material' in k.lower():
-                            material_text = v
-                            break
-
-                # Description (Fit & style block)
-                description = ""
-                desc_heading = soup.find('h2', string=lambda s: s and 'Fit & style' in (s or ''))
-                if desc_heading:
-                    parent = desc_heading.find_parent()
-                    if parent:
-                        raw_desc = parent.get_text(strip=True)[:500]
-                        if highlights:
-                            body_after_heading = raw_desc.replace("Fit & style", "", 1).strip().lower()
-                            highlights_joined = " ".join(h.strip().lower() for h in highlights)
-                            if len(body_after_heading) > 15 and (
-                                highlights_joined in body_after_heading or body_after_heading in highlights_joined
-                            ):
-                                description = "Fit & style"
-                            else:
-                                description = raw_desc
-                        else:
-                            description = raw_desc
-
-                seller = ""
-                seller_link = soup.find('a', {'data-test': 'targetPlusExtraInfoSection'})
-                if seller_link:
-                    seller = seller_link.get_text(strip=True)
-
-                colors = []
-                color_selected = ""
-                # Preferred: data-test variation component (avoid hashed chip/carousel classes)
-                variation_components = soup.find_all(attrs={'data-test': '@web/VariationComponent'})
-                color_component = None
-                for comp in variation_components:
-                    if 'color' in (comp.get_text(" ", strip=True) or '').lower():
-                        color_component = comp
-                        break
-                if not color_component and variation_components:
-                    color_component = variation_components[0]
-
-                if color_component:
-                    opts: List[Tuple[str, str, bool]] = []
-                    for a in color_component.find_all('a', href=True):
-                        text = a.get_text(strip=True) or (a.get('aria-label') or '').strip()
-                        if not text or len(text) > 40:
-                            continue
-                        is_selected = (
-                            a.get('aria-current') in ('page', 'true')
-                            or a.get('aria-selected') == 'true'
-                        )
-                        opts.append((text, a.get('href') or '', is_selected))
-                    colors = [t for t, _, _ in opts]
-                    for t, _, is_sel in opts:
-                        if is_sel:
-                            color_selected = t
-                            break
-                if not color_selected and colors:
-                    # Heuristic: infer from URL slug fragments
-                    for part in product_url.split('/'):
-                        if part and any(part.lower() == c.lower().replace(' ', '-') for c in colors):
-                            color_selected = part
-                            break
-
-                return ProductMetadata(
-                    product_id=product_id,
-                    tcin=tcin,
-                    title=title,
-                    url=product_url,
-                    brand=brand,
-                    price_current=current_price,
-                    price_regular=regular_price,
-                    sale_price=sale_price,
-                    rating=rating,
-                    rating_count=rating_count,
-                    category_breadcrumb=category_breadcrumb,
-                    description=description,
-                    material_text=material_text,
-                    highlights=highlights,
-                    feature_bullets=feature_bullets,
-                    images=images,
-                    dimensions=dimensions,
-                    dimensions_table=dimensions_table,
-                    specifications=specifications,
-                    seller=seller,
-                    colors=colors,
-                    color_selected=color_selected
-                    ,
-                    add_to_cart_available=add_to_cart_available,
-                    in_stock=in_stock,
-                )
-            except Exception as e:
-                last_error = e
-                if "Timeout" in str(e) and attempt == 0:
-                    logger.warning(f"Timeout on {product_url}, retrying once...")
-                    continue
-                break
-        if last_error:
-            logger.error(f"Error extracting product detail from {product_url}: {last_error}")
-        return None
-
-    async def _get_listing_page(self, page: Page, url: str) -> str:
-        """
-        Navigate to a listing page and return its HTML content.
-        Handles loading dynamic content by waiting for product cards and scrolling.
-        """
-        try:
-            logger.info(f"Fetching: {url}")
-            await page.goto(url, wait_until='domcontentloaded', timeout=60000)
-            # Target's DOM can vary; wait for any selector that reliably indicates product cards.
-            card_selectors = [
-                'div[data-test="product-grid"]',
-                '[data-test="@web/site-top-of-funnel/ProductCardWrapper"]',
-                'a[data-test="@web/ProductCard/title"]',
-                'a[href*="/p/"][href*="/A-"]',
-                'a[href*="/A-"]',
-            ]
-            selector_found = False
-            for selector in card_selectors:
-                try:
-                    await page.wait_for_selector(selector, timeout=30000)
-                    selector_found = True
-                    break
-                except Exception:
-                    continue
-
-            if not selector_found:
-                # Provide quick diagnostics to help understand whether the page is gated/blocked.
-                try:
-                    title = await page.title()
-                    logger.error(f"Listing page did not show product cards. Page title: {title!r} | url: {page.url}")
-                except Exception:
-                    logger.error(f"Listing page did not show product cards. url: {page.url}")
-
-            # Scroll until product links stop increasing (avoids missing lazy-loaded cards)
-            await self._scroll_listing_until_stable(page)
-            html = await page.content()
-
-            if not selector_found:
-                # Log a small snippet when blocked pages return unexpected HTML.
-                snippet = re.sub(r'\s+', ' ', html[:400]).strip()
-                if snippet:
-                    logger.error(f"Listing page HTML snippet: {snippet}")
-            return html
-        except Exception as e:
-            logger.error(f"Error fetching listing page: {e}")
-            return ""
-
-    async def scrape_listing_page(self, page: Page, url: str) -> List[ProductMetadata]:
-        """
-        Scrape all product cards on a listing page.
-
-        Args:
-            page: Playwright Page object
-            url: URL of the listing page
-
-        Returns:
-            List of ProductMetadata instances extracted from the page.
-        """
-        products: List[ProductMetadata] = []
-        try:
-            html = await self._get_listing_page(page, url)
-            if not html:
-                return products
-            soup = BeautifulSoup(html, 'html.parser')
-
-            # Primary: extract all product links via stable data-test selector
-            link_items = await self._extract_listing_title_links(page)
-            logger.info(f"Found {len(link_items)} product links on page")
-
-            if link_items:
-                for it in link_items:
-                    if self.max_products and len(self.products) + len(products) >= self.max_products:
-                        break
-
-                    raw_href = it.get('href', '')
-                    title = it.get('title', '')
-                    full_url = f"https://www.target.com{raw_href}" if raw_href.startswith('/') else raw_href
-
-                    # Enrich from the card wrapper if present in the HTML snapshot
-                    product: Optional[ProductMetadata] = None
-                    try:
-                        a = soup.find('a', {'data-test': '@web/ProductCard/title', 'href': raw_href})
-                        if a:
-                            wrapper = a.find_parent('div', {'data-test': '@web/site-top-of-funnel/ProductCardWrapper'})
-                            if wrapper:
-                                product = await self._extract_product_card_data(str(wrapper))
-                    except Exception:
-                        product = None
-
-                    if not product:
-                        product_id = self._extract_product_id(raw_href)
-                        product = ProductMetadata(
-                            product_id=product_id,
-                            tcin=product_id,
-                            title=title or "",
-                            url=full_url,
-                        )
-                    else:
-                        # Ensure URL/title are present even if the card parser missed them
-                        if not product.url:
-                            product.url = full_url
-                        if not product.title and title:
-                            product.title = title
-                        if not product.tcin:
-                            product.tcin = product.product_id
-
-                    products.append(product)
-                    logger.debug(f"Extracted link: {product.title[:50]}...")
-                    await self._random_delay()
-            else:
-                # Secondary: parse card wrappers from HTML snapshot.
-                product_cards = soup.find_all('div', {'data-test': '@web/site-top-of-funnel/ProductCardWrapper'})
-                logger.info(f"Fallback: Found {len(product_cards)} product cards on page")
-                for card in product_cards:
-                    if self.max_products and len(self.products) + len(products) >= self.max_products:
-                        break
-                    product = await self._extract_product_card_data(str(card))
-                    if product:
-                        if not product.tcin:
-                            product.tcin = product.product_id
-                        products.append(product)
-                        logger.debug(f"Extracted: {product.title[:50]}...")
-                    await self._random_delay()
-            return products
-        except Exception as e:
-            logger.error(f"Error scraping listing page: {e}")
-            return products
-
-    async def get_next_page_url(self, page: Page) -> Optional[str]:
-        """
-        Advance to the next listing page using Target's stable pagination controls.
-
-        Primary strategy: click `button[data-test="next"]` and wait for new products.
-        Returns the new page URL, or None if no next page is available.
-        """
-        try:
-            await page.wait_for_selector('[data-test="@web/ProductCard/title"]', timeout=30000)
-            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            await asyncio.sleep(0.6)
-
-            next_btn = page.locator('button[data-test="next"]')
-            if await next_btn.count() == 0:
-                return None
-            if await next_btn.is_disabled():
-                return None
-
-            prev_url = page.url
-            prev_first = await page.locator('[data-test="@web/ProductCard/title"]').first.get_attribute('href')
-            await next_btn.first.scroll_into_view_if_needed()
-            await next_btn.first.click()
-
-            try:
-                await page.wait_for_function(
-                    """([prevUrl, prevFirst]) => {
-                        const curUrl = location.href;
-                        const curFirst = (document.querySelector('[data-test="@web/ProductCard/title"]')?.getAttribute('href') || '');
-                        return curUrl !== prevUrl || curFirst !== (prevFirst || '');
-                    }""",
-                    arg=[prev_url, prev_first or ""],
-                    timeout=30000,
-                )
-            except Exception:
-                pass
-
-            await self._scroll_listing_until_stable(page)
-            return page.url
-        except Exception as e:
-            logger.error(f"Error getting next page URL: {e}")
-            return None
-
-    def _extract_product_id(self, url: str) -> str:
-        """
-        Extract product ID from a Target product URL.
-        Expected format contains "/A-<digits>".
-        """
-        match = re.search(r'/A-(\d+)', url)
-        return match.group(1) if match else ""
-
-    def _parse_price(self, price_str: str) -> float:
-        """
-        Parse a price string and return its numeric value.
-        Returns 0.0 if parsing fails.
-        """
-        try:
-            match = re.search(r'[\d,.]+', price_str.replace(',', ''))
-            if match:
-                return float(match.group())
-        except (ValueError, AttributeError):
-            pass
-        return 0.0
-
-    async def scrape(self, include_details: bool = False):
-        """
-        Main scraping loop.
-        Visits listing pages until either no more pages are available or the
-        maximum number of products has been reached. Optionally visits each
-        product page to gather additional details.
-
-        Args:
-            include_details: Whether to fetch detail pages for each product.
-        """
-        try:
-            await self.setup()
-            listing_page = await self.context.new_page()
-            detail_page = await self.context.new_page() if include_details else None
-            current_url = self.base_url
-            page_num = 1
-            while current_url and (not self.max_products or len(self.products) < self.max_products):
-                logger.info(f"Scraping page {page_num}...")
-                products = await self.scrape_listing_page(listing_page, current_url)
-                self.products.extend(products)
-                if include_details and detail_page:
-                    for product in products:
-                        if not product.url:
-                            continue
-                        detail = await self._extract_product_detail(detail_page, product.url)
-                        if detail:
-                            # Merge detail fields into the listing product
-                            product.images = detail.images or product.images
-                            product.highlights = detail.highlights or product.highlights
-                            product.feature_bullets = detail.feature_bullets or product.feature_bullets
-                            product.dimensions = detail.dimensions or product.dimensions
-                            product.dimensions_table = detail.dimensions_table or product.dimensions_table
-                            product.specifications = detail.specifications or product.specifications
-                            product.description = detail.description or product.description
-                            product.seller = detail.seller or product.seller
-                            product.category_breadcrumb = detail.category_breadcrumb or product.category_breadcrumb
-                            product.material_text = detail.material_text or product.material_text
-                            if detail.tcin:
-                                product.tcin = detail.tcin
-                            if detail.sale_price > 0:
-                                product.sale_price = detail.sale_price
-                            if detail.colors:
-                                product.colors = detail.colors
-                            if detail.price_current > 0:
-                                product.price_current = detail.price_current
-                            if detail.price_regular > 0:
-                                product.price_regular = detail.price_regular
-                            if detail.color_selected:
-                                product.color_selected = detail.color_selected
-                            if detail.brand:
-                                product.brand = detail.brand
-                            if detail.rating > 0:
-                                product.rating = detail.rating
-                            if detail.rating_count > 0:
-                                product.rating_count = detail.rating_count
-                            product.add_to_cart_available = detail.add_to_cart_available
-                            product.in_stock = detail.in_stock
-                        await self._random_delay()
-                # Determine next page
-                current_url = await self.get_next_page_url(listing_page)
-                if current_url:
-                    page_num += 1
-                    logger.info(f"Next page available: {current_url}")
-                else:
-                    logger.info("No more pages available")
-                    break
-            logger.info(f"Scraping complete. Total products: {len(self.products)}")
-            await listing_page.close()
+    async def _shutdown_browser(self, context: BrowserContext, listing_page: Page, detail_page: Optional[Page]):
+        with suppress(Exception):
             if detail_page:
                 await detail_page.close()
+        with suppress(Exception):
+            await listing_page.close()
+        with suppress(Exception):
+            await context.close()
+        with suppress(Exception):
+            await context.browser.close()
+        with suppress(Exception):
+            await context.playwright.stop()
+        logger.debug("Browser resources cleaned up")
+
+    # ─── Listing page ────────────────────────────────────────────────────────
+
+    async def _scrape_listing_page(self, page: Page, url: str) -> List[Product]:
+        logger.info(f"Scraping → {url}")
+
+        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        await asyncio.sleep(5)               # Give anti-bot / proxy time
+        await page.wait_for_load_state("networkidle", timeout=40000)
+
+        # ─── DEBUG: Save raw HTML ────────────────────────────────────────
+        html = await page.content()
+        debug_path = Path("debug_listing.html")
+        debug_path.write_text(html, encoding="utf-8")
+        logger.info(f"Raw page saved for debug → {debug_path.absolute()}")
+
+        products: List[Product] = []
+
+        # Try DOM method first
+        try:
+            await page.wait_for_selector('[data-test="@web/ProductCard/title"]', timeout=18000)
+            logger.info("Product cards detected in DOM → using DOM scraping")
+            await self._scroll_until_stable(page)
+
+            items = await page.evaluate("""
+            () => {
+                const cards = document.querySelectorAll('[data-test="@web/site-top-of-funnel/ProductCardWrapper"]');
+                return Array.from(cards).map(card => {
+                    const link = card.querySelector('a[data-test="@web/ProductCard/title"]');
+                    if (!link) return null;
+                    const href = link.getAttribute('href') || '';
+                    const title = link.textContent?.trim() || '';
+                    const priceEl = card.querySelector('[data-test="current-price"]');
+                    const price = priceEl?.textContent?.trim() || '';
+                    return { href, title, price };
+                }).filter(Boolean);
+            }
+            """)
+
+            for item in items:
+                if not item['href']:
+                    continue
+                full_url = "https://www.target.com" + item['href'] if item['href'].startswith("/") else item['href']
+                tcin_match = re.search(r'/A-(\d+)', full_url)
+                tcin = tcin_match.group(1) if tcin_match else ""
+
+                prod = Product(
+                    tcin=tcin,
+                    title=item['title'],
+                    url=full_url,
+                    price=self._parse_price(item['price'])
+                )
+                products.append(prod)
+
+                if self.max_products and len(self.products) + len(products) >= self.max_products:
+                    break
+
         except Exception as e:
-            logger.error(f"Error during scraping: {e}")
+            logger.warning(f"DOM method failed: {e}. Trying fallback...")
+
+        if not products:
+            title = await page.title()
+            logger.warning(f"No cards found. Page title = {title!r}")
+            if "Access Denied" in title or "403" in title or "Just a moment" in title:
+                logger.error("Likely blocked by Target / Cloudflare. Try different proxy.")
+
+        logger.info(f"   → found {len(products)} products")
+        return products
+
+    async def _scroll_until_stable(self, page: Page, max_attempts=22):
+        prev_count = -1
+        stable = 0
+        for _ in range(max_attempts):
+            count = await page.evaluate(
+                """() => document.querySelectorAll('[data-test="@web/ProductCard/title"]').length"""
+            )
+            if count == prev_count:
+                stable += 1
+                if stable >= 5:
+                    break
+            else:
+                stable = 0
+                prev_count = count
+            await page.evaluate("window.scrollBy(0, window.innerHeight * 1.6)")
+            await asyncio.sleep(1.1)
+
+    # ─── Detail enrichment (unchanged but with extra wait) ────────────────
+
+    async def _enrich_with_details(self, page: Page, product: Product):
+        try:
+            await page.goto(product.url, wait_until="domcontentloaded", timeout=60000)
+            await asyncio.sleep(4)
+            await page.wait_for_selector('h1[data-test="product-title"]', timeout=30000)
+
+            for text in ["Specifications", "About this item"]:
+                try:
+                    btn = page.locator(f'button:has-text("{text}")')
+                    if await btn.count() > 0 and await btn.get_attribute("aria-expanded") != "true":
+                        await btn.first.click()
+                        await asyncio.sleep(0.7)
+                except:
+                    pass
+
+            html = await page.content()
+            soup = BeautifulSoup(html, "html.parser")
+
+            title_el = soup.select_one('h1[data-test="product-title"]')
+            if title_el:
+                product.title = title_el.get_text(strip=True)
+
+            brand_el = soup.select_one('a[data-test="shopAllBrandLink"]')
+            if brand_el:
+                product.brand = brand_el.get_text(strip=True).replace("Shop all ", "").strip()
+
+            price_el = soup.select_one('[data-test="product-price"]')
+            if price_el:
+                product.price = self._parse_price(price_el.get_text(strip=True))
+
+            rating_el = soup.select_one('div.styles_ndsRatingStars__uEZcs span[aria-hidden="true"]')
+            if rating_el:
+                try:
+                    product.rating = float(rating_el.get_text(strip=True))
+                except:
+                    pass
+
+            review_el = soup.select_one('span.styles_ratingCount__QDWQY')
+            if review_el:
+                txt = review_el.get_text(strip=True).strip("()")
+                try:
+                    product.review_count = int(txt.replace(",", ""))
+                except:
+                    pass
+
+            for pic in soup.select('picture img[src*="scene7.com"]'):
+                src = pic.get("src") or ""
+                if "scene7.com" in src and src not in product.images:
+                    clean_src = re.sub(r'\?.*', '?wid=1200&hei=1200&qlt=85', src)
+                    product.images.append(clean_src)
+
+            desc = soup.select_one('[data-test="item-details-description"]')
+            if desc:
+                product.description = " ".join(desc.stripped_strings)[:800].strip()
+
+            specs_block = soup.select_one('[data-test="item-details-specifications"]')
+            if specs_block:
+                for row in specs_block.find_all("div"):
+                    b = row.find("b")
+                    if not b:
+                        continue
+                    key = b.get_text(strip=True).rstrip(":").strip()
+                    value = row.get_text(strip=True).split(":", 1)[-1].strip()
+                    if key and value:
+                        product.specs[key] = value
+                        if "material" in key.lower():
+                            product.material = value
+                        if any(kw in key.lower() for kw in ["dimension", "height", "width", "depth"]):
+                            product.dimensions[key] = value
+
+        except Exception as e:
+            logger.debug(f"Detail failed for {product.tcin}: {e}")
+
+    def _parse_price(self, s: str) -> float:
+        if not s:
+            return 0.0
+        try:
+            cleaned = re.sub(r'[^\d.]', '', s)
+            return float(cleaned) if cleaned else 0.0
+        except:
+            return 0.0
+
+    # ─── Main run ───────────────────────────────────────────────────────────
+
+    async def run(self):
+        context, listing_page = await self._init_browser()
+        detail_page = await context.new_page() if self.get_details else None
+
+        try:
+            url = self.base_url
+            page_num = 1
+
+            while url and (not self.max_products or len(self.products) < self.max_products):
+                logger.info(f"Page {page_num}  ──  {url}")
+
+                new_products = await self._scrape_listing_page(listing_page, url)
+                self.products.extend(new_products)
+
+                if len(new_products) == 0:
+                    logger.warning("Zero products → possible block / geo-restriction / bad proxy")
+                    break
+
+                if self.get_details and detail_page:
+                    for prod in new_products:
+                        if not prod.url:
+                            continue
+                        await self._enrich_with_details(detail_page, prod)
+                        await self._delay()
+
+                        if self.max_products and len(self.products) >= self.max_products:
+                            break
+
+                next_url = await self._get_next_page_url(listing_page)
+                if not next_url:
+                    logger.info("No more pages")
+                    break
+
+                url = next_url
+                page_num += 1
+                await self._delay()
+
+            logger.info(f"Finished. Total products collected: {len(self.products)}")
+
         finally:
-            await self.cleanup()
+            await self._shutdown_browser(context, listing_page, detail_page)
 
-    def save_json(self, output_path: str = "../output/target_handbags_scraped.json"):
-        """Save products as JSON"""
+        self._save_results()
+
+    async def _get_next_page_url(self, page: Page) -> Optional[str]:
         try:
-            output_dir = Path(output_path).parent
-            output_dir.mkdir(parents=True, exist_ok=True)
-            with open(output_path, 'w', encoding='utf-8') as f:
-                data = [product.to_dict() for product in self.products]
-                json.dump(data, f, indent=2, ensure_ascii=False)
-            logger.info(f"Saved {len(self.products)} products to {output_path}")
-        except Exception as e:
-            logger.error(f"Error saving JSON: {e}")
+            next_btn = page.locator('button[data-test="next"]:not([disabled])')
+            if await next_btn.count() == 0:
+                return None
 
-    def save_jsonl(self, output_path: str = "../output/target_handbags.jsonl"):
-        """Save products as JSONL"""
-        try:
-            output_dir = Path(output_path).parent
-            output_dir.mkdir(parents=True, exist_ok=True)
-            with open(output_path, 'w', encoding='utf-8') as f:
-                for product in self.products:
-                    f.write(json.dumps(product.to_dict(), ensure_ascii=False) + '\n')
-            logger.info(f"Saved {len(self.products)} products to {output_path}")
-        except Exception as e:
-            logger.error(f"Error saving JSONL: {e}")
+            current_url = page.url
+            await next_btn.first.click()
+            await asyncio.sleep(2.5)
 
-    def save_csv(self, output_path: str = "../output/target_handbags.csv"):
-        """Save products as CSV"""
-        try:
-            output_dir = Path(output_path).parent
-            output_dir.mkdir(parents=True, exist_ok=True)
-            if not self.products:
-                logger.warning("No products to save")
-                return
-            data = [product.to_dict() for product in self.products]
-            fieldnames = list(data[0].keys())
-            with open(output_path, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.DictWriter(f, fieldnames=fieldnames)
-                writer.writeheader()
-                writer.writerows(data)
-            logger.info(f"Saved {len(self.products)} products to {output_path}")
-        except Exception as e:
-            logger.error(f"Error saving CSV: {e}")
+            for _ in range(15):
+                if page.url != current_url:
+                    return page.url
+                await asyncio.sleep(0.6)
 
-    def save_all(self, output_dir: str = "../output"):
-        """
-        Save products in JSON, JSONL, and CSV formats with a timestamp.
-        """
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.save_json(f"{output_dir}/target_handbags_{timestamp}.json")
-        self.save_jsonl(f"{output_dir}/target_handbags_{timestamp}.jsonl")
-        self.save_csv(f"{output_dir}/target_handbags_{timestamp}.csv")
+            return None
+        except:
+            return None
+
+    def _save_results(self):
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        path_json = self.output_dir / f"target_handbags_{ts}.json"
+        with open(path_json, "w", encoding="utf-8") as f:
+            json.dump([p.to_dict() for p in self.products], f, indent=2, ensure_ascii=False)
+        logger.info(f"Saved JSON → {path_json}")
+
+        path_jsonl = self.output_dir / f"target_handbags_{ts}.jsonl"
+        with open(path_jsonl, "w", encoding="utf-8") as f:
+            for p in self.products:
+                f.write(json.dumps(p.to_dict(), ensure_ascii=False) + "\n")
+        logger.info(f"Saved JSONL → {path_jsonl}")
 
 
-async def main():
-    """Command‑line interface entry point"""
+# ─── CLI ─────────────────────────────────────────────────────────────────
+
+def parse_args():
     import argparse
-    parser = argparse.ArgumentParser(description='Scrape Target handbags')
-    parser.add_argument('--max-products', type=int, default=None, help='Maximum products to scrape')
-    parser.add_argument('--delay-min', type=float, default=1.5, help='Minimum delay between requests')
-    parser.add_argument('--delay-max', type=float, default=3.0, help='Maximum delay between requests')
-    parser.add_argument('--headless', action='store_true', default=True, help='Run in headless mode (default)')
-    parser.add_argument('--headed', action='store_true', help='Run with a visible browser window (sets headless=False)')
-    parser.add_argument('--verbose', action='store_true', help='Verbose logging')
-    parser.add_argument('--details', action='store_true', help='Extract detailed product info')
-    parser.add_argument('--allow-proxy', action='store_true', help='Allow inheriting proxy env vars (default: proxies disabled)')
-    parser.add_argument('--output-dir', default='../output', help='Output directory')
+    parser = argparse.ArgumentParser(description="Target Handbags Scraper – Proxy Hardcoded")
+    parser.add_argument("--max-products", type=int, default=None, help="Max products to scrape")
+    parser.add_argument("--details", action="store_true", help="Scrape detail pages")
+    parser.add_argument("--output-dir", default="./output", help="Output folder")
+    parser.add_argument("--headless", action="store_true", default=True, help="Run headless")
+    parser.add_argument("--headed", action="store_true", help="Show browser")
+    parser.add_argument("--verbose", action="store_true", help="Verbose logs")
     args = parser.parse_args()
     if args.headed:
         args.headless = False
+    return args
+
+
+async def main():
+    args = parse_args()
+
     scraper = TargetHandbagsScraper(
         max_products=args.max_products,
-        delay_min=args.delay_min,
-        delay_max=args.delay_max,
+        get_details=args.details,
+        output_dir=args.output_dir,
         headless=args.headless,
-        verbose=args.verbose,
-        allow_proxy=args.allow_proxy,
+        verbose=args.verbose
     )
-    await scraper.scrape(include_details=args.details)
-    scraper.save_all(args.output_dir)
+
+    await scraper.run()
 
 
-if __name__ == '__main__':
-    try:
-        asyncio.run(main())
-    except (BrokenPipeError, ValueError):
-        try:
-            import sys
-            sys.stdout.close()
-            sys.stderr.close()
-        except Exception:
-            pass
-        raise SystemExit(0)
+if __name__ == "__main__":
+    asyncio.run(main())
