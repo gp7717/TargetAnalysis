@@ -1,0 +1,81 @@
+# Python / packaging
+__pycache__/
+*.py[cod]
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+*.whl
+
+# Virtual environments (very common names)
+.venv/
+venv/
+env/
+ENV/
+.venv*
+venv*
+env*
+pyvenv.cfg
+pip-selfcheck.json
+
+# Environment / secrets
+.env
+.env.*
+!.env.example          # keep example tracked
+
+# IDE / Cursor / editor files
+.cursor/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Project-specific generated/output folders
+*.log
+*.tmp
+*.cache
+.cache/
+chroma/                # ← if using ChromaDB persistent storage
+chromadb/
+vectorstore/
+embeddings/
+
+# Scraped / downloaded data (add more as your scraper grows)
+scraper/data/
+scraper/downloads/
+scraper/output/
+scraper/*.jsonl
+scraper/*.json
+scraper/*.csv
+scraper/*.tsv
+scraper/*.parquet
+scraper/images/
+scraper/media/
+
+# Plans & temporary AI-generated markdown files
+*.plan.md
+*_plan.md
+cursor*.md
+plans/*.md             # if you keep generating many plans
+
+# macOS / Windows junk
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+desktop.ini
+
+# Optional – large model files / checkpoints (uncomment when needed)
+# *.pt
+# *.pth
+# *.safetensors
+# *.bin
+# *.onnx
+# models/
+# checkpoints/

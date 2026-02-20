@@ -1,0 +1,17 @@
+playwright==1.50.0
+beautifulsoup4==4.12.3
+lxml==5.3.1
+pandas==2.1.4
+requests==2.31.0
+
+# Chroma DB + CLIP ingestion (for handbags vector store)
+python-dotenv>=1.0.0
+chromadb>=0.4.0
+torch
+torchvision
+ftfy
+regex
+tqdm
+Pillow
+# CLIP: install from GitHub (no PyPI package):
+#   pip install git+https://github.com/openai/CLIP.git
