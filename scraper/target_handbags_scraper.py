@@ -21,6 +21,7 @@ from typing import List, Optional, Dict, Any
 
 from playwright.async_api import async_playwright, Page, BrowserContext
 from bs4 import BeautifulSoup
+from playwright_stealth import Stealth
 
 # ────────────────────────────────────────────────
 # Logging
@@ -160,6 +161,11 @@ class TargetHandbagsScraper:
             "headless": launch_headless,
             "devtools": self.devtools,
             "slow_mo": self.slow_mo or 0,
+            "args": [
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
         }
         if self.proxy:
             # Playwright requires credentials as separate fields, NOT embedded
@@ -177,12 +183,14 @@ class TargetHandbagsScraper:
             logger.info(f"Using proxy: {server}" + (f" (authenticated as {parsed.username})" if parsed.username else ""))
         self._browser = await self._pw.chromium.launch(**launch_kwargs)
 
+        _ua = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/132.0.0.0 Safari/537.36"
+        )
+        _sec_ch_ua = '"Not A(Brand";v="8", "Chromium";v="132", "Google Chrome";v="132"'
         context = await self._browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/128.0.0.0 Safari/537.36"
-            ),
+            user_agent=_ua,
             viewport={"width": 1280, "height": 900},
             locale="en-US",
             ignore_https_errors=True,
@@ -195,11 +203,21 @@ class TargetHandbagsScraper:
                 # failures on Target's CDN (assets.targetimg1.com) which
                 # blocks all Next.js bundles and prevents React from hydrating.
                 "Accept-Language": "en-US,en;q=0.9",
-                "Sec-Ch-Ua": '"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"',
+                "Sec-Ch-Ua": _sec_ch_ua,
                 "Sec-Ch-Ua-Mobile": "?0",
                 "Sec-Ch-Ua-Platform": '"Windows"',
             },
         )
+
+        # Apply playwright-stealth to mask all Playwright/CDP automation
+        # signals: navigator.webdriver, chrome runtime mocks, plugin lists,
+        # WebGL fingerprints, permissions API, etc.
+        stealth = Stealth(
+            navigator_user_agent_override=_ua,
+            sec_ch_ua_override=_sec_ch_ua,
+        )
+        await stealth.apply_stealth_async(context)
+
         page = await context.new_page()
 
         if self.verbose or self.devtools:
@@ -546,8 +564,8 @@ class TargetHandbagsScraper:
             await self._bring_to_front(page, "detail")
             # "load" ensures all scripts are executed before we look for
             # product title, specs, and images.
-            await page.goto(product.url, wait_until="load", timeout=60000)
-            await page.wait_for_selector('h1[data-test="product-title"]', timeout=20000)
+            await page.goto(product.url, wait_until="networkidle", timeout=90000)
+            await page.wait_for_selector('h1[data-test="product-title"]', timeout=30000)
 
             # Expand accordion sections if collapsed, scrolling them into
             # view first so Playwright can interact with them reliably.
@@ -556,11 +574,11 @@ class TargetHandbagsScraper:
                     btn = page.locator(f'button:has-text("{label}")').first
                     if await btn.count() > 0:
                         await btn.scroll_into_view_if_needed(timeout=3000)
-                        await asyncio.sleep(0.2)
+                        await asyncio.sleep(0.6)
                         expanded = await btn.get_attribute("aria-expanded")
                         if expanded != "true":
                             await btn.click()
-                            await asyncio.sleep(0.5)
+                            await asyncio.sleep(1.5)
                 except Exception:
                     pass
 
@@ -578,7 +596,7 @@ class TargetHandbagsScraper:
                     el = page.locator(sel).first
                     if await el.count() > 0:
                         await el.scroll_into_view_if_needed(timeout=3000)
-                        await asyncio.sleep(0.15)
+                        await asyncio.sleep(0.6)
                 except Exception:
                     pass
 
